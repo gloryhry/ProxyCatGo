@@ -28,6 +28,25 @@
 - `display_level` int
 - `service_status` (`running|stopped`)
 - `config` object
+- `health_check` object
+  - `enabled` bool
+  - `interval_seconds` int
+  - `timeout_seconds` int
+  - `concurrency` int
+  - `auto_apply` bool
+  - `auto_persist` bool
+  - `min_pool_size` int
+  - `running` bool
+  - `last_check_at` int64 (unix)
+  - `duration_ms` int64
+  - `before_total` int
+  - `valid_total` int
+  - `applied` bool
+  - `persisted` bool
+  - `skipped` bool
+  - `skip_reason` string
+  - `last_error` string
+  - `last_check_ago_seconds` int64
 
 ### 2) `POST /api/config`
 - 请求：JSON 键值对（保存到 `[Server]`）
@@ -44,6 +63,32 @@
 - 错误返回：`status=error` + `proxy_check_failed`
 - 检测范围：`http|https|socks5`
 - 检测缓存：按 `proxy + test_url`，TTL 10s
+
+### 4.1) `POST /api/proxies/refresh_valid`
+- 鉴权：需要 token
+- 请求体（可选，均为可选字段）：
+  - `apply` bool（默认读取 `health_check.auto_apply`）
+  - `persist` bool（默认读取 `health_check.auto_persist`）
+  - `force_switch` bool（默认 `false`）
+  - `test_url` string（默认读取配置 `test_url`，再回退 `https://www.baidu.com`）
+- 响应：
+  - `status`：`success|error`
+  - `message`：`proxy_refresh_success|proxy_refresh_failed|proxy_refresh_skipped`
+  - `result`：
+    - `triggered_at` int64 (unix)
+    - `duration_ms` int64
+    - `before_total` int
+    - `valid_total` int
+    - `applied` bool
+    - `persisted` bool
+    - `skipped` bool
+    - `skip_reason` string
+    - `current_proxy` string
+    - `last_error` string
+    - `valid_proxies` string[]
+- 约束：
+  - 当 `valid_total < health_check_min_pool_size` 时，返回 skipped，不应用到运行态
+  - `persist=true` 且 `use_getip=true` 时不落盘（仅内存）
 
 ### 5) `GET/POST /api/ip_lists`
 - GET：`{whitelist:string[],blacklist:string[]}`

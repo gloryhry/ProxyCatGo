@@ -3,6 +3,7 @@ package control
 import (
 	"crypto/tls"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"io"
 	"net"
@@ -68,6 +69,7 @@ func (s *Server) Handler() http.Handler {
 	mux.Handle("/api/config", http.HandlerFunc(s.configHandler))
 	mux.Handle("/api/proxies", http.HandlerFunc(s.proxiesHandler))
 	mux.Handle("/api/check_proxies", http.HandlerFunc(s.checkProxies))
+	mux.Handle("/api/proxies/refresh_valid", s.withToken(http.HandlerFunc(s.refreshValidProxies)))
 	mux.Handle("/api/ip_lists", http.HandlerFunc(s.ipListsHandler))
 	mux.Handle("/api/logs", http.HandlerFunc(s.logsHandler))
 	mux.Handle("/api/logs/clear", http.HandlerFunc(s.clearLogs))
@@ -141,6 +143,7 @@ func (s *Server) status(w http.ResponseWriter, r *http.Request) {
 		"display_level":  toInt(cfg["display_level"], 1),
 		"service_status": map[bool]string{true: "running", false: "stopped"}[snap.Running],
 		"config":         cfg,
+		"health_check":   s.service.GetHealthSnapshot(),
 		"m5": map[string]any{
 			"active_connections":         s.service.ActiveConnectionCount(),
 			"max_concurrent_connections": s.service.MaxConcurrentConnections(),
@@ -265,6 +268,93 @@ func (s *Server) checkProxies(w http.ResponseWriter, r *http.Request) {
 		"message":       i18n.Get("proxy_check_result", lang, strconv.Itoa(len(valid))),
 	})
 }
+
+func (s *Server) refreshValidProxies(w http.ResponseWriter, r *http.Request) {
+	if r.Method != http.MethodPost {
+		writeJSON(w, http.StatusMethodNotAllowed, map[string]any{"status": "error", "message": "method not allowed"})
+		return
+	}
+
+	s.cfgMu.RLock()
+	lang := fallback(s.cfg.Server["language"], "cn")
+	defaultTestURL := strings.TrimSpace(s.cfg.Server["test_url"])
+	s.cfgMu.RUnlock()
+	if defaultTestURL == "" {
+		defaultTestURL = "https://www.baidu.com"
+	}
+
+	health := s.service.GetHealthSnapshot()
+	applyDefault := health.AutoApply
+	persistDefault := health.AutoPersist
+
+	var body struct {
+		Apply       *bool   `json:"apply"`
+		Persist     *bool   `json:"persist"`
+		ForceSwitch *bool   `json:"force_switch"`
+		TestURL     *string `json:"test_url"`
+	}
+	if err := json.NewDecoder(r.Body).Decode(&body); err != nil && !errors.Is(err, io.EOF) {
+		writeJSON(w, http.StatusBadRequest, map[string]any{"status": "error", "message": err.Error()})
+		return
+	}
+
+	opts := dataplane.RefreshValidOptions{
+		Apply:       applyDefault,
+		Persist:     persistDefault,
+		ForceSwitch: false,
+		TestURL:     defaultTestURL,
+	}
+	if body.Apply != nil {
+		opts.Apply = *body.Apply
+	}
+	if body.Persist != nil {
+		opts.Persist = *body.Persist
+	}
+	if body.ForceSwitch != nil {
+		opts.ForceSwitch = *body.ForceSwitch
+	}
+	if body.TestURL != nil && strings.TrimSpace(*body.TestURL) != "" {
+		opts.TestURL = strings.TrimSpace(*body.TestURL)
+	}
+
+	result, err := s.service.RefreshValidProxies(opts)
+	payload := map[string]any{
+		"triggered_at":  result.TriggeredAt.Unix(),
+		"duration_ms":   result.DurationMS,
+		"before_total":  result.BeforeTotal,
+		"valid_total":   result.ValidTotal,
+		"applied":       result.Applied,
+		"persisted":     result.Persisted,
+		"skipped":       result.Skipped,
+		"skip_reason":   result.SkipReason,
+		"current_proxy": result.CurrentProxy,
+		"last_error":    result.LastError,
+		"valid_proxies": result.ValidProxies,
+	}
+
+	if result.Skipped {
+		writeJSON(w, http.StatusOK, map[string]any{
+			"status":  "success",
+			"message": i18n.Get("proxy_refresh_skipped", lang),
+			"result":  payload,
+		})
+		return
+	}
+	if err != nil {
+		writeJSON(w, http.StatusOK, map[string]any{
+			"status":  "error",
+			"message": i18n.Get("proxy_refresh_failed", lang, err.Error()),
+			"result":  payload,
+		})
+		return
+	}
+	writeJSON(w, http.StatusOK, map[string]any{
+		"status":  "success",
+		"message": i18n.Get("proxy_refresh_success", lang),
+		"result":  payload,
+	})
+}
+
 func (s *Server) ipListsHandler(w http.ResponseWriter, r *http.Request) {
 	s.cfgMu.RLock()
 	whitelist := filepath.Join("config", filepath.Base(fallback(s.cfg.Server["whitelist_file"], "whitelist.txt")))

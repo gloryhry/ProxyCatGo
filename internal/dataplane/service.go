@@ -14,6 +14,8 @@ import (
 	"net"
 	"net/http"
 	"net/url"
+	"os"
+	"path/filepath"
 	"strconv"
 	"strings"
 	"sync"
@@ -61,6 +63,17 @@ type Service struct {
 	connSem           chan struct{}
 	activeConns       map[net.Conn]time.Time
 
+	healthCheckEnabled     bool
+	healthCheckInterval    time.Duration
+	healthCheckTimeout     time.Duration
+	healthCheckConcurrency int
+	healthCheckAutoApply   bool
+	healthCheckAutoPersist bool
+	healthCheckMinPoolSize int
+	healthCheckTestURL     string
+	healthCheckRunning     bool
+	healthStatus           HealthCheckStatus
+
 	listener net.Listener
 	cancel   context.CancelFunc
 	wg       sync.WaitGroup
@@ -78,21 +91,351 @@ type Snapshot struct {
 	TimeLeft     float64
 }
 
+type RefreshValidOptions struct {
+	Apply       bool
+	Persist     bool
+	ForceSwitch bool
+	TestURL     string
+}
+
+type RefreshValidResult struct {
+	TriggeredAt  time.Time
+	DurationMS   int64
+	BeforeTotal  int
+	ValidTotal   int
+	Applied      bool
+	Persisted    bool
+	Skipped      bool
+	SkipReason   string
+	CurrentProxy string
+	LastError    string
+	ValidProxies []string
+}
+
+type HealthCheckStatus struct {
+	LastCheckAt time.Time
+	DurationMS  int64
+	BeforeTotal int
+	ValidTotal  int
+	Applied     bool
+	Persisted   bool
+	Skipped     bool
+	SkipReason  string
+	LastError   string
+}
+
+type HealthCheckSnapshot struct {
+	Enabled          bool   `json:"enabled"`
+	IntervalSeconds  int    `json:"interval_seconds"`
+	TimeoutSeconds   int    `json:"timeout_seconds"`
+	Concurrency      int    `json:"concurrency"`
+	AutoApply        bool   `json:"auto_apply"`
+	AutoPersist      bool   `json:"auto_persist"`
+	MinPoolSize      int    `json:"min_pool_size"`
+	Running          bool   `json:"running"`
+	LastCheckAt      int64  `json:"last_check_at"`
+	DurationMS       int64  `json:"duration_ms"`
+	BeforeTotal      int    `json:"before_total"`
+	ValidTotal       int    `json:"valid_total"`
+	Applied          bool   `json:"applied"`
+	Persisted        bool   `json:"persisted"`
+	Skipped          bool   `json:"skipped"`
+	SkipReason       string `json:"skip_reason"`
+	LastError        string `json:"last_error"`
+	LastCheckAgoSecs int64  `json:"last_check_ago_seconds"`
+}
+
+func healthStatusToSnapshot(status HealthCheckStatus, enabled bool, interval, timeout time.Duration, concurrency int, autoApply, autoPersist bool, minPool int, running bool) HealthCheckSnapshot {
+	last := int64(0)
+	ago := int64(-1)
+	if !status.LastCheckAt.IsZero() {
+		last = status.LastCheckAt.Unix()
+		ago = int64(time.Since(status.LastCheckAt).Seconds())
+	}
+	return HealthCheckSnapshot{
+		Enabled:          enabled,
+		IntervalSeconds:  int(interval.Seconds()),
+		TimeoutSeconds:   int(timeout.Seconds()),
+		Concurrency:      concurrency,
+		AutoApply:        autoApply,
+		AutoPersist:      autoPersist,
+		MinPoolSize:      minPool,
+		Running:          running,
+		LastCheckAt:      last,
+		DurationMS:       status.DurationMS,
+		BeforeTotal:      status.BeforeTotal,
+		ValidTotal:       status.ValidTotal,
+		Applied:          status.Applied,
+		Persisted:        status.Persisted,
+		Skipped:          status.Skipped,
+		SkipReason:       status.SkipReason,
+		LastError:        status.LastError,
+		LastCheckAgoSecs: ago,
+	}
+}
+
+func defaultRefreshValidOptions() RefreshValidOptions {
+	return RefreshValidOptions{TestURL: "https://www.baidu.com"}
+}
+
+func normalizeRefreshValidOptions(opts RefreshValidOptions) RefreshValidOptions {
+	base := defaultRefreshValidOptions()
+	base.Apply = opts.Apply
+	base.Persist = opts.Persist
+	base.ForceSwitch = opts.ForceSwitch
+	if strings.TrimSpace(opts.TestURL) != "" {
+		base.TestURL = strings.TrimSpace(opts.TestURL)
+	}
+	return base
+}
+
+func parseSecondsWithMin(v string, d, min int) time.Duration {
+	n := atoiDefault(v, d)
+	if n < min {
+		n = min
+	}
+	return time.Duration(n) * time.Second
+}
+
+func parseIntWithMin(v string, d, min int) int {
+	n := atoiDefault(v, d)
+	if n < min {
+		return min
+	}
+	return n
+}
+
+func toBoolDefault(v string, d bool) bool {
+	trimmed := strings.TrimSpace(v)
+	if trimmed == "" {
+		return d
+	}
+	return toBool(trimmed)
+}
+
+func shouldPersistToFile(useGetIP bool, requested bool) bool {
+	return requested && !useGetIP
+}
+
+func containsProxy(list []string, target string) bool {
+	target = strings.TrimSpace(target)
+	if target == "" {
+		return false
+	}
+	for _, item := range list {
+		if item == target {
+			return true
+		}
+	}
+	return false
+}
+
+func sanitizeProxyFilePath(proxyFile string) string {
+	name := filepath.Base(strings.TrimSpace(proxyFile))
+	if name == "" || name == "." || name == "/" {
+		name = "ip.txt"
+	}
+	return filepath.Join("config", name)
+}
+
+func persistProxyList(path string, proxies []string) error {
+	if err := os.MkdirAll(filepath.Dir(path), 0o755); err != nil {
+		return err
+	}
+	content := strings.Join(proxies, "\n")
+	if len(proxies) > 0 {
+		content += "\n"
+	}
+	return os.WriteFile(path, []byte(content), 0o644)
+}
+
+func (s *Service) updateHealthStatus(result RefreshValidResult) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	s.healthStatus = HealthCheckStatus{
+		LastCheckAt: result.TriggeredAt,
+		DurationMS:  result.DurationMS,
+		BeforeTotal: result.BeforeTotal,
+		ValidTotal:  result.ValidTotal,
+		Applied:     result.Applied,
+		Persisted:   result.Persisted,
+		Skipped:     result.Skipped,
+		SkipReason:  result.SkipReason,
+		LastError:   result.LastError,
+	}
+}
+
+func (s *Service) tryBeginHealthCheck() bool {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	if s.healthCheckRunning {
+		return false
+	}
+	s.healthCheckRunning = true
+	return true
+}
+
+func (s *Service) endHealthCheck() {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	s.healthCheckRunning = false
+}
+
+func (s *Service) snapshotProxiesForHealth() (proxies []string, currentProxy string, proxyFile string, useGetIP bool, minPool int, timeout time.Duration, concurrency int) {
+	s.mu.RLock()
+	defer s.mu.RUnlock()
+	list := make([]string, len(s.proxies))
+	copy(list, s.proxies)
+	return list, s.currentProxy, s.proxyFile, s.useGetIP, s.healthCheckMinPoolSize, s.healthCheckTimeout, s.healthCheckConcurrency
+}
+
+func (s *Service) snapshotHealthConfig() (enabled bool, interval, timeout time.Duration, concurrency int, autoApply, autoPersist bool, minPool int, testURL string) {
+	s.mu.RLock()
+	defer s.mu.RUnlock()
+	return s.healthCheckEnabled,
+		s.healthCheckInterval,
+		s.healthCheckTimeout,
+		s.healthCheckConcurrency,
+		s.healthCheckAutoApply,
+		s.healthCheckAutoPersist,
+		s.healthCheckMinPoolSize,
+		s.healthCheckTestURL
+}
+
+func checkProxyWithTimeout(proxyAddr, testURL string, timeout time.Duration) bool {
+	proxyAddr = strings.TrimSpace(proxyAddr)
+	if proxyAddr == "" {
+		return false
+	}
+	u, err := url.Parse(proxyAddr)
+	if err != nil {
+		return false
+	}
+	switch strings.ToLower(u.Scheme) {
+	case "http", "https":
+		return checkHTTPProxyWithTimeout(proxyAddr, testURL, timeout)
+	case "socks5":
+		return checkSOCKS5ProxyWithTimeout(proxyAddr, testURL, timeout)
+	default:
+		return false
+	}
+}
+
+func checkHTTPProxyWithTimeout(proxyAddr, testURL string, timeout time.Duration) bool {
+	proxyURL, err := url.Parse(proxyAddr)
+	if err != nil {
+		return false
+	}
+	tr := &http.Transport{Proxy: http.ProxyURL(proxyURL), TLSClientConfig: &tls.Config{InsecureSkipVerify: true}}
+	client := &http.Client{Transport: tr, Timeout: timeout}
+	resp, err := client.Get(testURL)
+	if err != nil && strings.HasPrefix(testURL, "https://") {
+		resp, err = client.Get("http://" + strings.TrimPrefix(testURL, "https://"))
+	}
+	if err != nil || resp == nil {
+		return false
+	}
+	defer resp.Body.Close()
+	return resp.StatusCode == http.StatusOK
+}
+
+func checkSOCKS5ProxyWithTimeout(proxyAddr, testURL string, timeout time.Duration) bool {
+	u, err := url.Parse(proxyAddr)
+	if err != nil {
+		return false
+	}
+	hostPort := u.Host
+	if !strings.Contains(hostPort, ":") {
+		hostPort = net.JoinHostPort(hostPort, "1080")
+	}
+	var auth *proxy.Auth
+	if u.User != nil {
+		pass, _ := u.User.Password()
+		auth = &proxy.Auth{User: u.User.Username(), Password: pass}
+	}
+	d := &net.Dialer{Timeout: timeout}
+	socksDialer, err := proxy.SOCKS5("tcp", hostPort, auth, d)
+	if err != nil {
+		return false
+	}
+	targetHost := extractHostForSOCKS(testURL)
+	conn, err := socksDialer.Dial("tcp", net.JoinHostPort(targetHost, "80"))
+	if err != nil {
+		return false
+	}
+	_ = conn.Close()
+	return true
+}
+
+func filterValidProxiesConcurrently(proxies []string, testURL string, timeout time.Duration, concurrency int) []string {
+	if len(proxies) == 0 {
+		return []string{}
+	}
+	if concurrency <= 0 {
+		concurrency = 1
+	}
+	if concurrency > len(proxies) {
+		concurrency = len(proxies)
+	}
+	type checkResult struct {
+		idx int
+		ok  bool
+	}
+	jobs := make(chan int)
+	results := make(chan checkResult, len(proxies))
+	var wg sync.WaitGroup
+	for i := 0; i < concurrency; i++ {
+		wg.Add(1)
+		go func() {
+			defer wg.Done()
+			for idx := range jobs {
+				results <- checkResult{idx: idx, ok: checkProxyWithTimeout(proxies[idx], testURL, timeout)}
+			}
+		}()
+	}
+	for i := range proxies {
+		jobs <- i
+	}
+	close(jobs)
+	wg.Wait()
+	close(results)
+
+	okFlags := make([]bool, len(proxies))
+	for res := range results {
+		if res.ok {
+			okFlags[res.idx] = true
+		}
+	}
+	valid := make([]string, 0, len(proxies))
+	for i, p := range proxies {
+		if okFlags[i] {
+			valid = append(valid, p)
+		}
+	}
+	return valid
+}
+
 func NewService(cfg *config.RuntimeConfig) *Service {
 	s := &Service{
 		lastSwitchTime:      time.Now(),
 		users:               map[string]string{},
-		switchCooldown:      5 * time.Second,
-		consecutiveFailures: map[string]int{},
-		failureLastSeen:     map[string]time.Time{},
-		proxyFailureThresh:  3,
-		proxyFailureCD:      3 * time.Second,
-		failureRetention:    5 * time.Minute,
-		getipRefreshMinimum: 2 * time.Second,
-		maxConcurrentConn:   1000,
-		connIOTimeout:       120 * time.Second,
-		cleanupInterval:     30 * time.Second,
-		activeConns:         map[net.Conn]time.Time{},
+		switchCooldown:         5 * time.Second,
+		consecutiveFailures:    map[string]int{},
+		failureLastSeen:        map[string]time.Time{},
+		proxyFailureThresh:     3,
+		proxyFailureCD:         3 * time.Second,
+		failureRetention:       5 * time.Minute,
+		getipRefreshMinimum:    2 * time.Second,
+		maxConcurrentConn:      1000,
+		connIOTimeout:          120 * time.Second,
+		cleanupInterval:        30 * time.Second,
+		activeConns:            map[net.Conn]time.Time{},
+		healthCheckEnabled:     true,
+		healthCheckInterval:    300 * time.Second,
+		healthCheckTimeout:     8 * time.Second,
+		healthCheckConcurrency: 50,
+		healthCheckMinPoolSize: 1,
+		healthCheckTestURL:     "https://www.baidu.com",
 	}
 	s.ApplyConfig(cfg)
 	return s
@@ -111,6 +454,17 @@ func (s *Service) ApplyConfig(cfg *config.RuntimeConfig) {
 	s.proxyFile = fallback(cfg.Server["proxy_file"], "ip.txt")
 	s.language = fallback(cfg.Server["language"], "cn")
 	s.port = atoiDefault(cfg.Server["port"], 1080)
+	s.healthCheckEnabled = toBoolDefault(cfg.Server["health_check_enabled"], true)
+	s.healthCheckInterval = parseSecondsWithMin(cfg.Server["health_check_interval"], 300, 1)
+	s.healthCheckTimeout = parseSecondsWithMin(cfg.Server["health_check_timeout"], 8, 1)
+	s.healthCheckConcurrency = parseIntWithMin(cfg.Server["health_check_concurrency"], 50, 1)
+	s.healthCheckAutoApply = toBoolDefault(cfg.Server["health_check_auto_apply"], false)
+	s.healthCheckAutoPersist = toBoolDefault(cfg.Server["health_check_auto_persist"], false)
+	s.healthCheckMinPoolSize = parseIntWithMin(cfg.Server["health_check_min_pool_size"], 1, 1)
+	s.healthCheckTestURL = strings.TrimSpace(cfg.Server["test_url"])
+	if s.healthCheckTestURL == "" {
+		s.healthCheckTestURL = "https://www.baidu.com"
+	}
 
 	s.users = cloneMap(cfg.Users)
 	s.authRequired = len(s.users) > 0
@@ -167,9 +521,10 @@ func (s *Service) Start() (bool, error) {
 	s.activeConns = map[net.Conn]time.Time{}
 	s.mu.Unlock()
 
-	s.wg.Add(2)
+	s.wg.Add(3)
 	go s.acceptLoop(ctx)
 	go s.cleanupLoop(ctx)
+	go s.runHealthCheckLoop(ctx)
 	slog.Info("proxy dataplane started", "port", s.port)
 	return true, nil
 }
@@ -669,6 +1024,101 @@ func (s *Service) cleanupFailureMap() {
 		delete(s.failureLastSeen, proxy)
 		delete(s.consecutiveFailures, proxy)
 	}
+}
+
+func (s *Service) runHealthCheckLoop(ctx context.Context) {
+	defer s.wg.Done()
+	ticker := time.NewTicker(s.healthCheckInterval)
+	defer ticker.Stop()
+	for {
+		select {
+		case <-ctx.Done():
+			return
+		case <-ticker.C:
+			enabled, _, _, _, autoApply, autoPersist, _, testURL := s.snapshotHealthConfig()
+			if !enabled {
+				continue
+			}
+			_, err := s.RefreshValidProxies(RefreshValidOptions{
+				Apply:       autoApply,
+				Persist:     autoPersist,
+				ForceSwitch: false,
+				TestURL:     testURL,
+			})
+			if err != nil {
+				slog.Warn("health check loop tick failed", "error", err)
+			}
+		}
+	}
+}
+
+func (s *Service) RefreshValidProxies(opts RefreshValidOptions) (RefreshValidResult, error) {
+	opts = normalizeRefreshValidOptions(opts)
+	if !s.tryBeginHealthCheck() {
+		res := RefreshValidResult{
+			TriggeredAt: time.Now(),
+			Skipped:     true,
+			SkipReason:  "in_progress",
+			LastError:   "health check already running",
+		}
+		s.updateHealthStatus(res)
+		return res, errors.New("health check already running")
+	}
+	defer s.endHealthCheck()
+
+	start := time.Now()
+	proxies, currentProxy, proxyFile, useGetIP, minPool, timeout, concurrency := s.snapshotProxiesForHealth()
+	valid := filterValidProxiesConcurrently(proxies, opts.TestURL, timeout, concurrency)
+
+	result := RefreshValidResult{
+		TriggeredAt:  start,
+		BeforeTotal:  len(proxies),
+		ValidTotal:   len(valid),
+		CurrentProxy: currentProxy,
+		ValidProxies: append([]string(nil), valid...),
+	}
+
+	errForReturn := ""
+	if opts.Apply {
+		if len(valid) < minPool {
+			result.Skipped = true
+			result.SkipReason = "below_min_pool_size"
+			result.LastError = fmt.Sprintf("valid proxies %d below min pool size %d", len(valid), minPool)
+		} else {
+			s.SetProxies(valid)
+			result.Applied = true
+			if opts.ForceSwitch {
+				if !containsProxy(valid, currentProxy) {
+					s.SwitchProxy()
+				}
+			}
+			result.CurrentProxy = s.CurrentProxyValue()
+			if shouldPersistToFile(useGetIP, opts.Persist) {
+				if err := persistProxyList(sanitizeProxyFilePath(proxyFile), valid); err != nil {
+					errForReturn = err.Error()
+					result.LastError = errForReturn
+				} else {
+					result.Persisted = true
+				}
+			}
+		}
+	}
+
+	result.DurationMS = time.Since(start).Milliseconds()
+	s.updateHealthStatus(result)
+	if errForReturn != "" {
+		return result, errors.New(errForReturn)
+	}
+	return result, nil
+}
+
+func (s *Service) GetHealthSnapshot() HealthCheckSnapshot {
+	enabled, interval, timeout, concurrency, autoApply, autoPersist, minPool, _ := s.snapshotHealthConfig()
+	s.mu.RLock()
+	status := s.healthStatus
+	running := s.healthCheckRunning
+	s.mu.RUnlock()
+	return healthStatusToSnapshot(status, enabled, interval, timeout, concurrency, autoApply, autoPersist, minPool, running)
 }
 
 func (s *Service) ActiveConnectionCount() int {
@@ -1200,6 +1650,32 @@ func (s *Service) timeUntilNextSwitchLocked() float64 {
 		return 0
 	}
 	return left
+}
+
+func extractHostForSOCKS(testURL string) string {
+	if strings.Contains(testURL, "://") {
+		u, err := url.Parse(testURL)
+		if err == nil && u.Host != "" {
+			h := u.Host
+			if strings.Contains(h, ":") {
+				h, _, _ = net.SplitHostPort(h)
+			}
+			if h != "" {
+				return h
+			}
+		}
+	}
+	h := testURL
+	if strings.Contains(h, "/") {
+		h = strings.SplitN(h, "/", 2)[0]
+	}
+	if strings.Contains(h, ":") {
+		h, _, _ = net.SplitHostPort(h)
+	}
+	if h == "" {
+		return "www.baidu.com"
+	}
+	return h
 }
 
 func defaultPortByScheme(scheme string) string {
