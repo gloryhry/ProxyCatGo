@@ -1,0 +1,18 @@
+services:
+  proxycatgo:
+    image: ghcr.io/gloryhry/proxycatgo:latest
+    container_name: proxycatgo
+    environment:
+      - TZ=Asia/Shanghai
+    ports:
+      - "1080:1080"
+      - "5000:5000"
+    volumes:
+      - ../../config:/app/config
+      - ../../logs:/app/logs
+    restart: unless-stopped
+    network_mode: bridge
+    # 如需本地构建调试，可取消注释以下 build 配置
+    # build:
+    #   context: ../..
+    #   dockerfile: deploy/docker/Dockerfile
