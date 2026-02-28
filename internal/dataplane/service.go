@@ -26,23 +26,24 @@ import (
 )
 
 type Service struct {
-	mu             sync.RWMutex
-	running        bool
-	mode           string
-	interval       int
-	useGetIP       bool
-	getipURL       string
-	proxyUsername  string
-	proxyPassword  string
-	currentProxy   string
-	proxies        []string
-	proxyIndex     int
-	proxyFile      string
-	language       string
-	authRequired   bool
-	users          map[string]string
-	lastSwitchTime time.Time
-	port           int
+	mu               sync.RWMutex
+	running          bool
+	mode             string
+	interval         int
+	useGetIP         bool
+	getipURL         string
+	getipProxyScheme string
+	proxyUsername    string
+	proxyPassword    string
+	currentProxy     string
+	proxies          []string
+	proxyIndex       int
+	proxyFile        string
+	language         string
+	authRequired     bool
+	users            map[string]string
+	lastSwitchTime   time.Time
+	port             int
 
 	switchingProxy      bool
 	lastSwitchAttempt   time.Time
@@ -417,8 +418,8 @@ func filterValidProxiesConcurrently(proxies []string, testURL string, timeout ti
 
 func NewService(cfg *config.RuntimeConfig) *Service {
 	s := &Service{
-		lastSwitchTime:      time.Now(),
-		users:               map[string]string{},
+		lastSwitchTime:         time.Now(),
+		users:                  map[string]string{},
 		switchCooldown:         5 * time.Second,
 		consecutiveFailures:    map[string]int{},
 		failureLastSeen:        map[string]time.Time{},
@@ -449,6 +450,7 @@ func (s *Service) ApplyConfig(cfg *config.RuntimeConfig) {
 	s.interval = atoiDefault(cfg.Server["interval"], 300)
 	s.useGetIP = toBool(cfg.Server["use_getip"])
 	s.getipURL = strings.TrimSpace(cfg.Server["getip_url"])
+	s.getipProxyScheme = normalizeGetIPProxyScheme(cfg.Server["getip_proxy_scheme"])
 	s.proxyUsername = strings.TrimSpace(cfg.Server["proxy_username"])
 	s.proxyPassword = strings.TrimSpace(cfg.Server["proxy_password"])
 	s.proxyFile = fallback(cfg.Server["proxy_file"], "ip.txt")
@@ -1358,7 +1360,7 @@ func (s *Service) ensureGetIPProxiesLocked(force bool) error {
 	oldCurrent := s.currentProxy
 	oldIndex := s.proxyIndex
 
-	list, err := fetchGetIPList(s.getipURL, s.proxyUsername, s.proxyPassword)
+	list, err := fetchGetIPList(s.getipURL, s.proxyUsername, s.proxyPassword, s.getipProxyScheme)
 	if err != nil {
 		if len(oldProxies) > 0 {
 			s.proxies = oldProxies
@@ -1378,14 +1380,29 @@ func (s *Service) ensureGetIPProxiesLocked(force bool) error {
 		return errors.New("empty getip proxies")
 	}
 
-	s.proxies = list
+	testURL := strings.TrimSpace(s.healthCheckTestURL)
+	if testURL == "" {
+		testURL = "https://www.baidu.com"
+	}
+	valid := filterValidProxiesConcurrently(list, testURL, s.healthCheckTimeout, s.healthCheckConcurrency)
+	if len(valid) == 0 {
+		if len(oldProxies) > 0 {
+			s.proxies = oldProxies
+			s.currentProxy = oldCurrent
+			s.proxyIndex = oldIndex
+			return nil
+		}
+		return errors.New("no valid getip proxies")
+	}
+
+	s.proxies = valid
 	s.proxyIndex = 0
 	s.currentProxy = s.proxies[0]
 	s.lastGetIPRefresh = time.Now()
 	return nil
 }
 
-func fetchGetIPList(urlStr, username, password string) ([]string, error) {
+func fetchGetIPList(urlStr, username, password, defaultScheme string) ([]string, error) {
 	client := &http.Client{Timeout: 10 * time.Second}
 	resp, err := client.Get(urlStr)
 	if err != nil {
@@ -1408,7 +1425,7 @@ func fetchGetIPList(urlStr, username, password string) ([]string, error) {
 	clean := make([]string, 0, len(proxies))
 	seen := map[string]struct{}{}
 	for _, p := range proxies {
-		n := normalizeProxy(p, username, password)
+		n := normalizeProxy(p, username, password, defaultScheme)
 		if n == "" {
 			continue
 		}
@@ -1451,7 +1468,7 @@ func parseGetIPPayload(body []byte) []string {
 	return out
 }
 
-func normalizeProxy(raw, username, password string) string {
+func normalizeProxy(raw, username, password, defaultScheme string) string {
 	raw = strings.TrimSpace(raw)
 	if raw == "" {
 		return ""
@@ -1469,10 +1486,21 @@ func normalizeProxy(raw, username, password string) string {
 		}
 		return u.String()
 	}
+	scheme := normalizeGetIPProxyScheme(defaultScheme)
 	if username != "" && password != "" {
-		return "socks5://" + username + ":" + password + "@" + raw
+		return scheme + "://" + username + ":" + password + "@" + raw
 	}
-	return "socks5://" + raw
+	return scheme + "://" + raw
+}
+
+func normalizeGetIPProxyScheme(raw string) string {
+	s := strings.ToLower(strings.TrimSpace(raw))
+	switch s {
+	case "http", "https", "socks5":
+		return s
+	default:
+		return "socks5"
+	}
 }
 
 func dialViaUpstream(proxyRaw, target string, timeout time.Duration) (net.Conn, error) {

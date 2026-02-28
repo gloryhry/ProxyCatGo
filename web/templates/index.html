@@ -1365,6 +1365,14 @@
                                         <input type="text" class="form-control" name="getip_url">
                                     </div>
                                     <div class="mb-3">
+                                        <label class="form-label" data-i18n="getip_proxy_scheme_label">API代理默认协议</label>
+                                        <select class="form-select" name="getip_proxy_scheme">
+                                            <option value="http" data-i18n="scheme_http">HTTP</option>
+                                            <option value="https" data-i18n="scheme_https">HTTPS</option>
+                                            <option value="socks5" data-i18n="scheme_socks5">SOCKS5</option>
+                                        </select>
+                                    </div>
+                                    <div class="mb-3">
                                         <label class="form-label" data-i18n="proxy_auth_username_label">代理认证用户名</label>
                                         <input type="text" class="form-control" name="proxy_username">
                                     </div>
@@ -1714,6 +1722,7 @@
                     // 修正checkbox的状态设置
                     $('input[name="use_getip"]').prop('checked', (config.use_getip || '').toLowerCase() === 'true');
                     $('input[name="getip_url"]').val(config.getip_url || '');
+                    $('select[name="getip_proxy_scheme"]').val(config.getip_proxy_scheme || 'socks5');
                     $('input[name="proxy_username"]').val(config.proxy_username || '');
                     $('input[name="proxy_password"]').val(config.proxy_password || '');
                     $('input[name="proxy_file"]').val(config.proxy_file || 'ip.txt');
@@ -2051,6 +2060,7 @@
                 // 修改这里，确保正确获取 checkbox 的值并转换为字符串
                 use_getip: $('input[name="use_getip"]').prop('checked').toString(),
                 getip_url: $('input[name="getip_url"]').val(),
+                getip_proxy_scheme: $('select[name="getip_proxy_scheme"]').val(),
                 proxy_username: $('input[name="proxy_username"]').val(),
                 proxy_password: $('input[name="proxy_password"]').val(),
                 proxy_file: $('input[name="proxy_file"]').val(),
@@ -2220,6 +2230,10 @@
                 'auth_config_title': '认证配置',
                 'use_api_label': '使用API获取代理',
                 'api_url_label': 'API地址',
+                'getip_proxy_scheme_label': 'API代理默认协议',
+                'scheme_http': 'HTTP',
+                'scheme_https': 'HTTPS',
+                'scheme_socks5': 'SOCKS5',
                 'enable_proxy_check_label': '代理有效性检测',
                 'proxy_list_label': '代理列表',
                 'save_proxy_btn': '保存代理',
@@ -2448,6 +2462,10 @@
                 'auth_config_title': 'Authentication',
                 'use_api_label': 'Use API for Proxy',
                 'api_url_label': 'API URL',
+                'getip_proxy_scheme_label': 'Default API Proxy Scheme',
+                'scheme_http': 'HTTP',
+                'scheme_https': 'HTTPS',
+                'scheme_socks5': 'SOCKS5',
                 'enable_proxy_check_label': 'Proxy Validity Check',
                 'proxy_list_label': 'Proxy List',
                 'save_proxy_btn': 'Save Proxies',
