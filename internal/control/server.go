@@ -319,17 +319,21 @@ func (s *Server) refreshValidProxies(w http.ResponseWriter, r *http.Request) {
 
 	result, err := s.service.RefreshValidProxies(opts)
 	payload := map[string]any{
-		"triggered_at":  result.TriggeredAt.Unix(),
-		"duration_ms":   result.DurationMS,
-		"before_total":  result.BeforeTotal,
-		"valid_total":   result.ValidTotal,
-		"applied":       result.Applied,
-		"persisted":     result.Persisted,
-		"skipped":       result.Skipped,
-		"skip_reason":   result.SkipReason,
-		"current_proxy": result.CurrentProxy,
-		"last_error":    result.LastError,
-		"valid_proxies": result.ValidProxies,
+		"triggered_at":    result.TriggeredAt.Unix(),
+		"duration_ms":     result.DurationMS,
+		"before_total":    result.BeforeTotal,
+		"valid_total":     result.ValidTotal,
+		"applied":         result.Applied,
+		"persisted":       result.Persisted,
+		"skipped":         result.Skipped,
+		"skip_reason":     result.SkipReason,
+		"current_proxy":   result.CurrentProxy,
+		"last_error":      result.LastError,
+		"valid_proxies":   result.ValidProxies,
+		"checked_proxies": result.CheckedProxies,
+		"passed_proxies":  result.PassedProxies,
+		"avg_pass_rate":   result.AvgPassRate,
+		"failure_reasons": result.FailureReasons,
 	}
 
 	if result.Skipped {

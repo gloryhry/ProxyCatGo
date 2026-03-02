@@ -64,16 +64,20 @@ type Service struct {
 	connSem           chan struct{}
 	activeConns       map[net.Conn]time.Time
 
-	healthCheckEnabled     bool
-	healthCheckInterval    time.Duration
-	healthCheckTimeout     time.Duration
-	healthCheckConcurrency int
-	healthCheckAutoApply   bool
-	healthCheckAutoPersist bool
-	healthCheckMinPoolSize int
-	healthCheckTestURL     string
-	healthCheckRunning     bool
-	healthStatus           HealthCheckStatus
+	healthCheckEnabled          bool
+	healthCheckInterval         time.Duration
+	healthCheckTimeout          time.Duration
+	healthCheckConcurrency      int
+	healthCheckAutoApply        bool
+	healthCheckAutoPersist      bool
+	healthCheckMinPoolSize      int
+	healthCheckMode             string
+	healthCheckSuccessRatio     float64
+	healthCheckAttemptsPerProxy int
+	healthCheckTargetPort       int
+	healthCheckTestURL          string
+	healthCheckRunning          bool
+	healthStatus                HealthCheckStatus
 
 	listener net.Listener
 	cancel   context.CancelFunc
@@ -100,53 +104,70 @@ type RefreshValidOptions struct {
 }
 
 type RefreshValidResult struct {
-	TriggeredAt  time.Time
-	DurationMS   int64
-	BeforeTotal  int
-	ValidTotal   int
-	Applied      bool
-	Persisted    bool
-	Skipped      bool
-	SkipReason   string
-	CurrentProxy string
-	LastError    string
-	ValidProxies []string
+	TriggeredAt    time.Time
+	DurationMS     int64
+	BeforeTotal    int
+	ValidTotal     int
+	Applied        bool
+	Persisted      bool
+	Skipped        bool
+	SkipReason     string
+	CurrentProxy   string
+	LastError      string
+	ValidProxies   []string
+	CheckedProxies int
+	PassedProxies  int
+	AvgPassRate    float64
+	FailureReasons map[string]int
+	ProxyPassRates map[string]float64
 }
 
 type HealthCheckStatus struct {
-	LastCheckAt time.Time
-	DurationMS  int64
-	BeforeTotal int
-	ValidTotal  int
-	Applied     bool
-	Persisted   bool
-	Skipped     bool
-	SkipReason  string
-	LastError   string
+	LastCheckAt    time.Time
+	DurationMS     int64
+	BeforeTotal    int
+	ValidTotal     int
+	Applied        bool
+	Persisted      bool
+	Skipped        bool
+	SkipReason     string
+	LastError      string
+	CheckedProxies int
+	PassedProxies  int
+	AvgPassRate    float64
+	FailureReasons map[string]int
 }
 
 type HealthCheckSnapshot struct {
-	Enabled          bool   `json:"enabled"`
-	IntervalSeconds  int    `json:"interval_seconds"`
-	TimeoutSeconds   int    `json:"timeout_seconds"`
-	Concurrency      int    `json:"concurrency"`
-	AutoApply        bool   `json:"auto_apply"`
-	AutoPersist      bool   `json:"auto_persist"`
-	MinPoolSize      int    `json:"min_pool_size"`
-	Running          bool   `json:"running"`
-	LastCheckAt      int64  `json:"last_check_at"`
-	DurationMS       int64  `json:"duration_ms"`
-	BeforeTotal      int    `json:"before_total"`
-	ValidTotal       int    `json:"valid_total"`
-	Applied          bool   `json:"applied"`
-	Persisted        bool   `json:"persisted"`
-	Skipped          bool   `json:"skipped"`
-	SkipReason       string `json:"skip_reason"`
-	LastError        string `json:"last_error"`
-	LastCheckAgoSecs int64  `json:"last_check_ago_seconds"`
+	Enabled          bool           `json:"enabled"`
+	IntervalSeconds  int            `json:"interval_seconds"`
+	TimeoutSeconds   int            `json:"timeout_seconds"`
+	Concurrency      int            `json:"concurrency"`
+	AutoApply        bool           `json:"auto_apply"`
+	AutoPersist      bool           `json:"auto_persist"`
+	MinPoolSize      int            `json:"min_pool_size"`
+	Mode             string         `json:"mode"`
+	SuccessRatio     float64        `json:"success_ratio"`
+	AttemptsPerProxy int            `json:"attempts_per_proxy"`
+	TargetPort       int            `json:"target_port"`
+	Running          bool           `json:"running"`
+	LastCheckAt      int64          `json:"last_check_at"`
+	DurationMS       int64          `json:"duration_ms"`
+	BeforeTotal      int            `json:"before_total"`
+	ValidTotal       int            `json:"valid_total"`
+	Applied          bool           `json:"applied"`
+	Persisted        bool           `json:"persisted"`
+	Skipped          bool           `json:"skipped"`
+	SkipReason       string         `json:"skip_reason"`
+	LastError        string         `json:"last_error"`
+	CheckedProxies   int            `json:"checked_proxies"`
+	PassedProxies    int            `json:"passed_proxies"`
+	AvgPassRate      float64        `json:"avg_pass_rate"`
+	FailureReasons   map[string]int `json:"failure_reasons"`
+	LastCheckAgoSecs int64          `json:"last_check_ago_seconds"`
 }
 
-func healthStatusToSnapshot(status HealthCheckStatus, enabled bool, interval, timeout time.Duration, concurrency int, autoApply, autoPersist bool, minPool int, running bool) HealthCheckSnapshot {
+func healthStatusToSnapshot(status HealthCheckStatus, enabled bool, interval, timeout time.Duration, concurrency int, autoApply, autoPersist bool, minPool int, mode string, successRatio float64, attemptsPerProxy int, targetPort int, running bool) HealthCheckSnapshot {
 	last := int64(0)
 	ago := int64(-1)
 	if !status.LastCheckAt.IsZero() {
@@ -161,6 +182,10 @@ func healthStatusToSnapshot(status HealthCheckStatus, enabled bool, interval, ti
 		AutoApply:        autoApply,
 		AutoPersist:      autoPersist,
 		MinPoolSize:      minPool,
+		Mode:             mode,
+		SuccessRatio:     successRatio,
+		AttemptsPerProxy: attemptsPerProxy,
+		TargetPort:       targetPort,
 		Running:          running,
 		LastCheckAt:      last,
 		DurationMS:       status.DurationMS,
@@ -171,6 +196,10 @@ func healthStatusToSnapshot(status HealthCheckStatus, enabled bool, interval, ti
 		Skipped:          status.Skipped,
 		SkipReason:       status.SkipReason,
 		LastError:        status.LastError,
+		CheckedProxies:   status.CheckedProxies,
+		PassedProxies:    status.PassedProxies,
+		AvgPassRate:      status.AvgPassRate,
+		FailureReasons:   cloneIntMap(status.FailureReasons),
 		LastCheckAgoSecs: ago,
 	}
 }
@@ -254,15 +283,19 @@ func (s *Service) updateHealthStatus(result RefreshValidResult) {
 	s.mu.Lock()
 	defer s.mu.Unlock()
 	s.healthStatus = HealthCheckStatus{
-		LastCheckAt: result.TriggeredAt,
-		DurationMS:  result.DurationMS,
-		BeforeTotal: result.BeforeTotal,
-		ValidTotal:  result.ValidTotal,
-		Applied:     result.Applied,
-		Persisted:   result.Persisted,
-		Skipped:     result.Skipped,
-		SkipReason:  result.SkipReason,
-		LastError:   result.LastError,
+		LastCheckAt:    result.TriggeredAt,
+		DurationMS:     result.DurationMS,
+		BeforeTotal:    result.BeforeTotal,
+		ValidTotal:     result.ValidTotal,
+		Applied:        result.Applied,
+		Persisted:      result.Persisted,
+		Skipped:        result.Skipped,
+		SkipReason:     result.SkipReason,
+		LastError:      result.LastError,
+		CheckedProxies: result.CheckedProxies,
+		PassedProxies:  result.PassedProxies,
+		AvgPassRate:    result.AvgPassRate,
+		FailureReasons: cloneIntMap(result.FailureReasons),
 	}
 }
 
@@ -290,7 +323,7 @@ func (s *Service) snapshotProxiesForHealth() (proxies []string, currentProxy str
 	return list, s.currentProxy, s.proxyFile, s.useGetIP, s.healthCheckMinPoolSize, s.healthCheckTimeout, s.healthCheckConcurrency
 }
 
-func (s *Service) snapshotHealthConfig() (enabled bool, interval, timeout time.Duration, concurrency int, autoApply, autoPersist bool, minPool int, testURL string) {
+func (s *Service) snapshotHealthConfig() (enabled bool, interval, timeout time.Duration, concurrency int, autoApply, autoPersist bool, minPool int, mode string, successRatio float64, attemptsPerProxy int, targetPort int, testURL string) {
 	s.mu.RLock()
 	defer s.mu.RUnlock()
 	return s.healthCheckEnabled,
@@ -300,50 +333,105 @@ func (s *Service) snapshotHealthConfig() (enabled bool, interval, timeout time.D
 		s.healthCheckAutoApply,
 		s.healthCheckAutoPersist,
 		s.healthCheckMinPoolSize,
+		s.healthCheckMode,
+		s.healthCheckSuccessRatio,
+		s.healthCheckAttemptsPerProxy,
+		s.healthCheckTargetPort,
 		s.healthCheckTestURL
 }
 
-func checkProxyWithTimeout(proxyAddr, testURL string, timeout time.Duration) bool {
+func checkProxyWithTimeout(proxyAddr, testURL string, timeout time.Duration, mode string, targetPort int) (bool, string) {
 	proxyAddr = strings.TrimSpace(proxyAddr)
 	if proxyAddr == "" {
-		return false
+		return false, "parse_failed"
 	}
 	u, err := url.Parse(proxyAddr)
 	if err != nil {
-		return false
+		return false, "parse_failed"
 	}
-	switch strings.ToLower(u.Scheme) {
-	case "http", "https":
-		return checkHTTPProxyWithTimeout(proxyAddr, testURL, timeout)
-	case "socks5":
-		return checkSOCKS5ProxyWithTimeout(proxyAddr, testURL, timeout)
+	switch strings.ToLower(strings.TrimSpace(mode)) {
+	case "", "traffic_simulation":
+		switch strings.ToLower(u.Scheme) {
+		case "http", "https":
+			return checkHTTPProxyWithTimeout(proxyAddr, testURL, timeout, true, targetPort)
+		case "socks5":
+			return checkSOCKS5ProxyWithTimeout(proxyAddr, testURL, timeout, true, targetPort)
+		default:
+			return false, "unsupported_scheme"
+		}
+	case "basic":
+		switch strings.ToLower(u.Scheme) {
+		case "http", "https":
+			return checkHTTPProxyWithTimeout(proxyAddr, testURL, timeout, false, targetPort)
+		case "socks5":
+			return checkSOCKS5ProxyWithTimeout(proxyAddr, testURL, timeout, false, targetPort)
+		default:
+			return false, "unsupported_scheme"
+		}
 	default:
-		return false
+		switch strings.ToLower(u.Scheme) {
+		case "http", "https":
+			return checkHTTPProxyWithTimeout(proxyAddr, testURL, timeout, true, targetPort)
+		case "socks5":
+			return checkSOCKS5ProxyWithTimeout(proxyAddr, testURL, timeout, true, targetPort)
+		default:
+			return false, "unsupported_scheme"
+		}
 	}
 }
 
-func checkHTTPProxyWithTimeout(proxyAddr, testURL string, timeout time.Duration) bool {
-	proxyURL, err := url.Parse(proxyAddr)
-	if err != nil {
-		return false
+func checkHTTPProxyWithTimeout(proxyAddr, testURL string, timeout time.Duration, trafficSimulation bool, targetPort int) (bool, string) {
+	if !trafficSimulation {
+		proxyURL, err := url.Parse(proxyAddr)
+		if err != nil {
+			return false, "parse_failed"
+		}
+		tr := &http.Transport{Proxy: http.ProxyURL(proxyURL), TLSClientConfig: &tls.Config{InsecureSkipVerify: true}}
+		client := &http.Client{Transport: tr, Timeout: timeout}
+		resp, err := client.Get(testURL)
+		if err != nil && strings.HasPrefix(testURL, "https://") {
+			resp, err = client.Get("http://" + strings.TrimPrefix(testURL, "https://"))
+		}
+		if err != nil || resp == nil {
+			return false, "connect_failed"
+		}
+		defer resp.Body.Close()
+		if resp.StatusCode == http.StatusOK {
+			return true, ""
+		}
+		return false, "connect_failed"
 	}
-	tr := &http.Transport{Proxy: http.ProxyURL(proxyURL), TLSClientConfig: &tls.Config{InsecureSkipVerify: true}}
-	client := &http.Client{Transport: tr, Timeout: timeout}
-	resp, err := client.Get(testURL)
-	if err != nil && strings.HasPrefix(testURL, "https://") {
-		resp, err = client.Get("http://" + strings.TrimPrefix(testURL, "https://"))
-	}
-	if err != nil || resp == nil {
-		return false
-	}
-	defer resp.Body.Close()
-	return resp.StatusCode == http.StatusOK
-}
 
-func checkSOCKS5ProxyWithTimeout(proxyAddr, testURL string, timeout time.Duration) bool {
+	target := net.JoinHostPort(extractHostForSOCKS(testURL), strconv.Itoa(normalizeTargetPort(targetPort)))
 	u, err := url.Parse(proxyAddr)
 	if err != nil {
-		return false
+		return false, "parse_failed"
+	}
+	hostPort := u.Host
+	if !strings.Contains(hostPort, ":") {
+		hostPort = net.JoinHostPort(hostPort, defaultPortByScheme(strings.ToLower(u.Scheme)))
+	}
+	user := ""
+	pass := ""
+	if u.User != nil {
+		user = u.User.Username()
+		pass, _ = u.User.Password()
+	}
+	conn, err := dialHTTPConnect(hostPort, target, user, pass, timeout, strings.EqualFold(u.Scheme, "https"))
+	if err != nil {
+		return false, "connect_failed"
+	}
+	defer conn.Close()
+	if err := tlsProbe(conn, extractHostForSOCKS(testURL), timeout); err != nil {
+		return false, "tls_failed"
+	}
+	return true, ""
+}
+
+func checkSOCKS5ProxyWithTimeout(proxyAddr, testURL string, timeout time.Duration, trafficSimulation bool, targetPort int) (bool, string) {
+	u, err := url.Parse(proxyAddr)
+	if err != nil {
+		return false, "parse_failed"
 	}
 	hostPort := u.Host
 	if !strings.Contains(hostPort, ":") {
@@ -357,20 +445,129 @@ func checkSOCKS5ProxyWithTimeout(proxyAddr, testURL string, timeout time.Duratio
 	d := &net.Dialer{Timeout: timeout}
 	socksDialer, err := proxy.SOCKS5("tcp", hostPort, auth, d)
 	if err != nil {
-		return false
+		return false, "connect_failed"
 	}
 	targetHost := extractHostForSOCKS(testURL)
-	conn, err := socksDialer.Dial("tcp", net.JoinHostPort(targetHost, "80"))
-	if err != nil {
-		return false
+	port := 80
+	if trafficSimulation {
+		port = normalizeTargetPort(targetPort)
 	}
-	_ = conn.Close()
-	return true
+	conn, err := socksDialer.Dial("tcp", net.JoinHostPort(targetHost, strconv.Itoa(port)))
+	if err != nil {
+		return false, "connect_failed"
+	}
+	defer conn.Close()
+	if trafficSimulation {
+		if err := tlsProbe(conn, targetHost, timeout); err != nil {
+			return false, "tls_failed"
+		}
+	}
+	return true, ""
 }
 
-func filterValidProxiesConcurrently(proxies []string, testURL string, timeout time.Duration, concurrency int) []string {
+func tlsProbe(conn net.Conn, serverName string, timeout time.Duration) error {
+	if err := conn.SetDeadline(time.Now().Add(timeout)); err != nil {
+		return err
+	}
+	tlsConn := tls.Client(conn, &tls.Config{ServerName: serverName, InsecureSkipVerify: true})
+	if err := tlsConn.Handshake(); err != nil {
+		return err
+	}
+	if err := tlsConn.SetDeadline(time.Time{}); err != nil {
+		return err
+	}
+	return nil
+}
+
+func normalizeTargetPort(v int) int {
+	if v <= 0 || v > 65535 {
+		return 443
+	}
+	return v
+}
+
+func normalizeHealthCheckMode(raw string) string {
+	v := strings.ToLower(strings.TrimSpace(raw))
+	switch v {
+	case "basic", "traffic_simulation":
+		return v
+	default:
+		return "traffic_simulation"
+	}
+}
+
+func parseRatioDefault(v string, d float64) float64 {
+	trimmed := strings.TrimSpace(v)
+	if trimmed == "" {
+		return d
+	}
+	n, err := strconv.ParseFloat(trimmed, 64)
+	if err != nil {
+		return d
+	}
+	if n < 0 {
+		return 0
+	}
+	if n > 1 {
+		return 1
+	}
+	return n
+}
+
+func cloneIntMap(src map[string]int) map[string]int {
+	if len(src) == 0 {
+		return map[string]int{}
+	}
+	out := make(map[string]int, len(src))
+	for k, v := range src {
+		out[k] = v
+	}
+	return out
+}
+
+type proxyCheckDetail struct {
+	proxy      string
+	successes  int
+	attempts   int
+	passRate   float64
+	passed     bool
+	lastReason string
+}
+
+func checkProxyWithAttempts(proxyAddr, testURL string, timeout time.Duration, mode string, targetPort int, attempts int, ratio float64) proxyCheckDetail {
+	if attempts <= 0 {
+		attempts = 1
+	}
+	detail := proxyCheckDetail{proxy: proxyAddr, attempts: attempts, lastReason: "connect_failed"}
+	for i := 0; i < attempts; i++ {
+		ok, reason := checkProxyWithTimeout(proxyAddr, testURL, timeout, mode, targetPort)
+		if ok {
+			detail.successes++
+			detail.lastReason = ""
+		} else {
+			detail.lastReason = reason
+		}
+	}
+	detail.passRate = float64(detail.successes) / float64(detail.attempts)
+	detail.passed = detail.passRate >= ratio
+	if !detail.passed && detail.lastReason == "" {
+		detail.lastReason = "below_success_ratio"
+	}
+	return detail
+}
+
+type proxyCheckAggregate struct {
+	valid          []string
+	checked        int
+	passed         int
+	avgPassRate    float64
+	failureReasons map[string]int
+	proxyPassRates map[string]float64
+}
+
+func filterValidProxiesConcurrently(proxies []string, testURL string, timeout time.Duration, concurrency int, mode string, targetPort int, attempts int, ratio float64) proxyCheckAggregate {
 	if len(proxies) == 0 {
-		return []string{}
+		return proxyCheckAggregate{valid: []string{}, failureReasons: map[string]int{}, proxyPassRates: map[string]float64{}}
 	}
 	if concurrency <= 0 {
 		concurrency = 1
@@ -379,8 +576,8 @@ func filterValidProxiesConcurrently(proxies []string, testURL string, timeout ti
 		concurrency = len(proxies)
 	}
 	type checkResult struct {
-		idx int
-		ok  bool
+		idx    int
+		detail proxyCheckDetail
 	}
 	jobs := make(chan int)
 	results := make(chan checkResult, len(proxies))
@@ -390,7 +587,8 @@ func filterValidProxiesConcurrently(proxies []string, testURL string, timeout ti
 		go func() {
 			defer wg.Done()
 			for idx := range jobs {
-				results <- checkResult{idx: idx, ok: checkProxyWithTimeout(proxies[idx], testURL, timeout)}
+				d := checkProxyWithAttempts(proxies[idx], testURL, timeout, mode, targetPort, attempts, ratio)
+				results <- checkResult{idx: idx, detail: d}
 			}
 		}()
 	}
@@ -401,42 +599,62 @@ func filterValidProxiesConcurrently(proxies []string, testURL string, timeout ti
 	wg.Wait()
 	close(results)
 
-	okFlags := make([]bool, len(proxies))
+	details := make([]proxyCheckDetail, len(proxies))
 	for res := range results {
-		if res.ok {
-			okFlags[res.idx] = true
-		}
+		details[res.idx] = res.detail
 	}
-	valid := make([]string, 0, len(proxies))
-	for i, p := range proxies {
-		if okFlags[i] {
-			valid = append(valid, p)
-		}
+
+	agg := proxyCheckAggregate{
+		valid:          make([]string, 0, len(proxies)),
+		checked:        len(proxies),
+		failureReasons: map[string]int{},
+		proxyPassRates: map[string]float64{},
 	}
-	return valid
+	for _, d := range details {
+		agg.proxyPassRates[d.proxy] = d.passRate
+		agg.avgPassRate += d.passRate
+		if d.passed {
+			agg.passed++
+			agg.valid = append(agg.valid, d.proxy)
+			continue
+		}
+		reason := d.lastReason
+		if reason == "" {
+			reason = "below_success_ratio"
+		}
+		agg.failureReasons[reason]++
+	}
+	if agg.checked > 0 {
+		agg.avgPassRate = agg.avgPassRate / float64(agg.checked)
+	}
+	return agg
 }
 
 func NewService(cfg *config.RuntimeConfig) *Service {
 	s := &Service{
-		lastSwitchTime:         time.Now(),
-		users:                  map[string]string{},
-		switchCooldown:         5 * time.Second,
-		consecutiveFailures:    map[string]int{},
-		failureLastSeen:        map[string]time.Time{},
-		proxyFailureThresh:     3,
-		proxyFailureCD:         3 * time.Second,
-		failureRetention:       5 * time.Minute,
-		getipRefreshMinimum:    2 * time.Second,
-		maxConcurrentConn:      1000,
-		connIOTimeout:          120 * time.Second,
-		cleanupInterval:        30 * time.Second,
-		activeConns:            map[net.Conn]time.Time{},
-		healthCheckEnabled:     true,
-		healthCheckInterval:    300 * time.Second,
-		healthCheckTimeout:     8 * time.Second,
-		healthCheckConcurrency: 50,
-		healthCheckMinPoolSize: 1,
-		healthCheckTestURL:     "https://www.baidu.com",
+		lastSwitchTime:              time.Now(),
+		users:                       map[string]string{},
+		switchCooldown:              5 * time.Second,
+		consecutiveFailures:         map[string]int{},
+		failureLastSeen:             map[string]time.Time{},
+		proxyFailureThresh:          3,
+		proxyFailureCD:              3 * time.Second,
+		failureRetention:            5 * time.Minute,
+		getipRefreshMinimum:         2 * time.Second,
+		maxConcurrentConn:           1000,
+		connIOTimeout:               120 * time.Second,
+		cleanupInterval:             30 * time.Second,
+		activeConns:                 map[net.Conn]time.Time{},
+		healthCheckEnabled:          true,
+		healthCheckInterval:         300 * time.Second,
+		healthCheckTimeout:          8 * time.Second,
+		healthCheckConcurrency:      50,
+		healthCheckMinPoolSize:      1,
+		healthCheckMode:             "traffic_simulation",
+		healthCheckSuccessRatio:     0.67,
+		healthCheckAttemptsPerProxy: 3,
+		healthCheckTargetPort:       443,
+		healthCheckTestURL:          "https://www.baidu.com",
 	}
 	s.ApplyConfig(cfg)
 	return s
@@ -463,6 +681,10 @@ func (s *Service) ApplyConfig(cfg *config.RuntimeConfig) {
 	s.healthCheckAutoApply = toBoolDefault(cfg.Server["health_check_auto_apply"], false)
 	s.healthCheckAutoPersist = toBoolDefault(cfg.Server["health_check_auto_persist"], false)
 	s.healthCheckMinPoolSize = parseIntWithMin(cfg.Server["health_check_min_pool_size"], 1, 1)
+	s.healthCheckMode = normalizeHealthCheckMode(cfg.Server["health_check_mode"])
+	s.healthCheckSuccessRatio = parseRatioDefault(cfg.Server["health_check_success_ratio"], 0.67)
+	s.healthCheckAttemptsPerProxy = parseIntWithMin(cfg.Server["health_check_attempts_per_proxy"], 3, 1)
+	s.healthCheckTargetPort = normalizeTargetPort(parseIntWithMin(cfg.Server["health_check_target_port"], 443, 1))
 	s.healthCheckTestURL = strings.TrimSpace(cfg.Server["test_url"])
 	if s.healthCheckTestURL == "" {
 		s.healthCheckTestURL = "https://www.baidu.com"
@@ -1037,7 +1259,7 @@ func (s *Service) runHealthCheckLoop(ctx context.Context) {
 		case <-ctx.Done():
 			return
 		case <-ticker.C:
-			enabled, _, _, _, autoApply, autoPersist, _, testURL := s.snapshotHealthConfig()
+			enabled, _, _, _, autoApply, autoPersist, _, _, _, _, _, testURL := s.snapshotHealthConfig()
 			if !enabled {
 				continue
 			}
@@ -1070,14 +1292,24 @@ func (s *Service) RefreshValidProxies(opts RefreshValidOptions) (RefreshValidRes
 
 	start := time.Now()
 	proxies, currentProxy, proxyFile, useGetIP, minPool, timeout, concurrency := s.snapshotProxiesForHealth()
-	valid := filterValidProxiesConcurrently(proxies, opts.TestURL, timeout, concurrency)
+	_, _, _, _, _, _, _, mode, successRatio, attemptsPerProxy, targetPort, _ := s.snapshotHealthConfig()
+	agg := filterValidProxiesConcurrently(proxies, opts.TestURL, timeout, concurrency, mode, targetPort, attemptsPerProxy, successRatio)
+	valid := agg.valid
 
 	result := RefreshValidResult{
-		TriggeredAt:  start,
-		BeforeTotal:  len(proxies),
-		ValidTotal:   len(valid),
-		CurrentProxy: currentProxy,
-		ValidProxies: append([]string(nil), valid...),
+		TriggeredAt:    start,
+		BeforeTotal:    len(proxies),
+		ValidTotal:     len(valid),
+		CurrentProxy:   currentProxy,
+		ValidProxies:   append([]string(nil), valid...),
+		CheckedProxies: agg.checked,
+		PassedProxies:  agg.passed,
+		AvgPassRate:    agg.avgPassRate,
+		FailureReasons: cloneIntMap(agg.failureReasons),
+		ProxyPassRates: agg.proxyPassRates,
+	}
+	if len(valid) == 0 && len(proxies) > 0 && len(result.FailureReasons) == 0 {
+		result.FailureReasons = map[string]int{"below_success_ratio": len(proxies)}
 	}
 
 	errForReturn := ""
@@ -1086,6 +1318,9 @@ func (s *Service) RefreshValidProxies(opts RefreshValidOptions) (RefreshValidRes
 			result.Skipped = true
 			result.SkipReason = "below_min_pool_size"
 			result.LastError = fmt.Sprintf("valid proxies %d below min pool size %d", len(valid), minPool)
+			if len(proxies) > 0 && len(result.FailureReasons) == 0 {
+				result.FailureReasons = map[string]int{"below_success_ratio": len(proxies)}
+			}
 		} else {
 			s.SetProxies(valid)
 			result.Applied = true
@@ -1115,12 +1350,12 @@ func (s *Service) RefreshValidProxies(opts RefreshValidOptions) (RefreshValidRes
 }
 
 func (s *Service) GetHealthSnapshot() HealthCheckSnapshot {
-	enabled, interval, timeout, concurrency, autoApply, autoPersist, minPool, _ := s.snapshotHealthConfig()
+	enabled, interval, timeout, concurrency, autoApply, autoPersist, minPool, mode, successRatio, attemptsPerProxy, targetPort, _ := s.snapshotHealthConfig()
 	s.mu.RLock()
 	status := s.healthStatus
 	running := s.healthCheckRunning
 	s.mu.RUnlock()
-	return healthStatusToSnapshot(status, enabled, interval, timeout, concurrency, autoApply, autoPersist, minPool, running)
+	return healthStatusToSnapshot(status, enabled, interval, timeout, concurrency, autoApply, autoPersist, minPool, mode, successRatio, attemptsPerProxy, targetPort, running)
 }
 
 func (s *Service) ActiveConnectionCount() int {
@@ -1360,46 +1595,72 @@ func (s *Service) ensureGetIPProxiesLocked(force bool) error {
 	oldCurrent := s.currentProxy
 	oldIndex := s.proxyIndex
 
-	list, err := fetchGetIPList(s.getipURL, s.proxyUsername, s.proxyPassword, s.getipProxyScheme)
-	if err != nil {
-		if len(oldProxies) > 0 {
-			s.proxies = oldProxies
-			s.currentProxy = oldCurrent
-			s.proxyIndex = oldIndex
-			return nil
-		}
-		return err
-	}
-	if len(list) == 0 {
-		if len(oldProxies) > 0 {
-			s.proxies = oldProxies
-			s.currentProxy = oldCurrent
-			s.proxyIndex = oldIndex
-			return nil
-		}
-		return errors.New("empty getip proxies")
-	}
-
 	testURL := strings.TrimSpace(s.healthCheckTestURL)
 	if testURL == "" {
 		testURL = "https://www.baidu.com"
 	}
-	valid := filterValidProxiesConcurrently(list, testURL, s.healthCheckTimeout, s.healthCheckConcurrency)
-	if len(valid) == 0 {
-		if len(oldProxies) > 0 {
-			s.proxies = oldProxies
-			s.currentProxy = oldCurrent
-			s.proxyIndex = oldIndex
-			return nil
+
+	const maxFetchAttempts = 3
+	var lastErr error
+	for attempt := 1; attempt <= maxFetchAttempts; attempt++ {
+		list, err := fetchGetIPList(s.getipURL, s.proxyUsername, s.proxyPassword, s.getipProxyScheme)
+		if err != nil {
+			lastErr = err
+			slog.Warn("getip fetch attempt failed", "attempt", attempt, "max_attempts", maxFetchAttempts, "error", err)
+			if attempt < maxFetchAttempts {
+				time.Sleep(200 * time.Millisecond)
+			}
+			continue
 		}
-		return errors.New("no valid getip proxies")
+		if len(list) == 0 {
+			lastErr = errors.New("empty getip proxies")
+			slog.Warn("getip fetch returned empty list", "attempt", attempt, "max_attempts", maxFetchAttempts)
+			if attempt < maxFetchAttempts {
+				time.Sleep(200 * time.Millisecond)
+			}
+			continue
+		}
+
+		agg := filterValidProxiesConcurrently(
+			list,
+			testURL,
+			s.healthCheckTimeout,
+			s.healthCheckConcurrency,
+			s.healthCheckMode,
+			s.healthCheckTargetPort,
+			s.healthCheckAttemptsPerProxy,
+			s.healthCheckSuccessRatio,
+		)
+		valid := agg.valid
+		if len(valid) == 0 {
+			lastErr = errors.New("no valid getip proxies")
+			slog.Warn("getip validation returned no valid proxies", "attempt", attempt, "max_attempts", maxFetchAttempts, "failure_reasons", agg.failureReasons)
+			if attempt < maxFetchAttempts {
+				time.Sleep(200 * time.Millisecond)
+			}
+			continue
+		}
+
+		s.proxies = valid
+		s.proxyIndex = 0
+		s.currentProxy = s.proxies[0]
+		s.lastGetIPRefresh = time.Now()
+		return nil
 	}
 
-	s.proxies = valid
-	s.proxyIndex = 0
-	s.currentProxy = s.proxies[0]
-	s.lastGetIPRefresh = time.Now()
-	return nil
+	if len(oldProxies) > 0 {
+		s.proxies = oldProxies
+		s.currentProxy = oldCurrent
+		s.proxyIndex = oldIndex
+		if lastErr != nil {
+			return nil
+		}
+		return nil
+	}
+	if lastErr != nil {
+		return lastErr
+	}
+	return errors.New("no valid getip proxies")
 }
 
 func fetchGetIPList(urlStr, username, password, defaultScheme string) ([]string, error) {

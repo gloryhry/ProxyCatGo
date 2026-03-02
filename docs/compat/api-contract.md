@@ -36,6 +36,10 @@
   - `auto_apply` bool
   - `auto_persist` bool
   - `min_pool_size` int
+  - `mode` string (`basic|traffic_simulation`)
+  - `success_ratio` number
+  - `attempts_per_proxy` int
+  - `target_port` int
   - `running` bool
   - `last_check_at` int64 (unix)
   - `duration_ms` int64
@@ -46,6 +50,10 @@
   - `skipped` bool
   - `skip_reason` string
   - `last_error` string
+  - `checked_proxies` int
+  - `passed_proxies` int
+  - `avg_pass_rate` number
+  - `failure_reasons` object(map[string]int)
   - `last_check_ago_seconds` int64
 
 ### 2) `POST /api/config`
@@ -86,6 +94,10 @@
     - `current_proxy` string
     - `last_error` string
     - `valid_proxies` string[]
+    - `checked_proxies` int
+    - `passed_proxies` int
+    - `avg_pass_rate` number
+    - `failure_reasons` object(map[string]int)
 - 约束：
   - 当 `valid_total < health_check_min_pool_size` 时，返回 skipped，不应用到运行态
   - `persist=true` 且 `use_getip=true` 时不落盘（仅内存）

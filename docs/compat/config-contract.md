@@ -18,6 +18,17 @@
 - `proxy_file`（默认 `ip.txt`）
 - `check_proxies`（`true|false`）
 - `test_url`
+- `health_check_enabled`（`true|false`，默认 `true`）
+- `health_check_interval`（秒，默认 `300`）
+- `health_check_timeout`（秒，默认 `8`）
+- `health_check_concurrency`（默认 `50`）
+- `health_check_auto_apply`（`true|false`，默认 `false`）
+- `health_check_auto_persist`（`true|false`，默认 `false`）
+- `health_check_min_pool_size`（默认 `1`）
+- `health_check_mode`（`basic|traffic_simulation`，默认 `traffic_simulation`）
+- `health_check_success_ratio`（`0~1`，默认 `0.67`）
+- `health_check_attempts_per_proxy`（默认 `3`）
+- `health_check_target_port`（默认 `443`）
 - `language`（`cn|en`）
 - `whitelist_file`（默认 `whitelist.txt`）
 - `blacklist_file`（默认 `blacklist.txt`）
